@@ -7,3 +7,4 @@ venv/
 .dsh/
 *.log
 grbl-eeprom.json
+workfield/

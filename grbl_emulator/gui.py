@@ -11,15 +11,33 @@ from __future__ import annotations
 
 import math
 import queue
+import threading
 import time
 import tkinter as tk
 from collections import deque
-from tkinter import messagebox, ttk
+from pathlib import Path
+from tkinter import filedialog, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
 
 from .engine import Engine, Snapshot
+from .pcb import (
+    Board,
+    Hole,
+    PcbError,
+    discover_sources,
+    guess_outline_layer,
+    parse_excellon_file,
+    parse_gerber_contours,
+)
 from .settings import SETTINGS
 from .transport import SerialTransport
+from .workfield import (
+    FieldGeometry,
+    PX_PER_MM,
+    center_offset,
+    default_output_path,
+    render_workfield,
+)
 
 # --------------------------------------------------------------------------- theme
 BG = "#0b0f14"
@@ -33,7 +51,19 @@ OK = "#3ddc97"
 WARN = "#ffb703"
 ERR = "#ef476f"
 VIOLET = "#c77dff"
-GRID = "#1a2532"
+
+# Light aluminium of the machine table (the bed is always shown as aluminium).
+ALU_LIGHT = "#d7dbdf"
+ALU_PANEL = "#c2c8ce"
+ALU_DARK = "#a9b0b7"
+ALU_EDGE = "#8d959d"
+ALU_LINE = "#b7bdc4"
+ALU_TEXT = "#4f5861"
+ALU_MUTED = "#6f7881"
+BOARD_FILL = "#c87533"
+BOARD_EDGE = "#8a4c1e"
+BOARD_SHADOW = "#adb5bc"
+BOARD_HOLE = "#000000"
 
 STATE_COLORS = {
     "Idle": OK,
@@ -138,6 +168,62 @@ class Host:
         return "rx"
 
 
+def _polygon_area(points: list[tuple[float, float]]) -> float:
+    area = 0.0
+    for index, (x1, y1) in enumerate(points):
+        x2, y2 = points[(index + 1) % len(points)]
+        area += x1 * y2 - x2 * y1
+    return area / 2.0
+
+
+def _point_in_polygon(x: float, y: float, points: list[tuple[float, float]]) -> bool:
+    inside = False
+    count = len(points)
+    for index in range(count):
+        x1, y1 = points[index]
+        x2, y2 = points[(index + 1) % count]
+        if (y1 > y) != (y2 > y):
+            cross_x = x1 + (y - y1) * (x2 - x1) / (y2 - y1)
+            if cross_x > x:
+                inside = not inside
+    return inside
+
+
+def _shade(color: str, factor: float) -> str:
+    """Lighten (factor > 1) or darken (factor < 1) a ``#rrggbb`` colour."""
+
+    def clamp(value: float) -> int:
+        return max(0, min(255, int(round(value))))
+
+    red, green, blue = (int(color[index : index + 2], 16) for index in (1, 3, 5))
+    return f"#{clamp(red * factor):02x}{clamp(green * factor):02x}{clamp(blue * factor):02x}"
+
+
+def _span_intersections(
+    loops: list[list[tuple[float, float]]], y: float
+) -> list[tuple[float, float]]:
+    """Even-odd scanline spans of screen-space polygons at *y*."""
+
+    crossings: list[float] = []
+    for loop in loops:
+        if len(loop) < 2:
+            continue
+        previous = loop[-1]
+        for point in loop:
+            x1, y1 = previous
+            x2, y2 = point
+            if (y1 <= y < y2) or (y2 <= y < y1):
+                crossings.append(x1 + (y - y1) * (x2 - x1) / (y2 - y1))
+            previous = point
+    crossings.sort()
+    spans: list[tuple[float, float]] = []
+    for index in range(0, len(crossings) - 1, 2):
+        left, right = crossings[index], crossings[index + 1]
+        if right - left > 0.5:
+            spans.append((left, right))
+    return spans
+
+
 # --------------------------------------------------------------------------- machine view
 class MachineView(tk.Canvas):
     """The virtual work table: a fixed bed and a moving (and spinning) cross."""
@@ -145,7 +231,7 @@ class MachineView(tk.Canvas):
     def __init__(self, master, **kwargs) -> None:
         super().__init__(
             master,
-            bg="#06090d",
+            bg=ALU_DARK,
             highlightthickness=0,
             bd=0,
             **kwargs,
@@ -155,11 +241,14 @@ class MachineView(tk.Canvas):
         self.angle = 0.0
         self.state = "Idle"
         self.rpm = 0.0
+        self.board: Board | None = None
+        self._board_offset = (0.0, 0.0)
+        self._board_items: list[int] = []
         self.trail: deque[tuple[float, float]] = deque(maxlen=900)
         self._geometry = (40.0, 100.0, 1.0)
         self._cross_ids: list[int] = []
         self._trail_id = self.create_line(
-            0, 0, 1, 1, fill="#2c5d75", width=1, state="hidden", smooth=True
+            0, 0, 1, 1, fill="#1f6f8b", width=1, state="hidden", smooth=True
         )
         self._build_cross_items()
         self.bind("<Configure>", lambda event: self._rebuild())
@@ -168,13 +257,13 @@ class MachineView(tk.Canvas):
     # ---------------------------------------------------------------- geometry
     def _build_cross_items(self) -> None:
         self._cross_arms = [
-            self.create_line(0, 0, 1, 1, fill=ACCENT, width=2, capstyle="round")
+            self.create_line(0, 0, 1, 1, fill="#2b3540", width=2, capstyle="round")
             for _ in range(2)
         ]
-        self._cross_index = self.create_line(0, 0, 1, 1, fill=OK, width=2, capstyle="round")
-        self._cross_ring = self.create_oval(0, 0, 1, 1, outline="#2a4a5d", width=1)
-        self._cross_hub = self.create_oval(0, 0, 1, 1, outline=TEXT, width=1, fill="#0d2633")
-        self._cross_dot = self.create_oval(0, 0, 1, 1, outline="", fill=OK)
+        self._cross_index = self.create_line(0, 0, 1, 1, fill="#c2410c", width=2, capstyle="round")
+        self._cross_ring = self.create_oval(0, 0, 1, 1, outline="#7b848d", width=1)
+        self._cross_hub = self.create_oval(0, 0, 1, 1, outline="#5f6871", width=1, fill="#eef1f3")
+        self._cross_dot = self.create_oval(0, 0, 1, 1, outline="", fill="#c2410c")
         self._labels: list[int] = []
 
     def _compute_geometry(self) -> tuple[float, float, float]:
@@ -207,15 +296,56 @@ class MachineView(tk.Canvas):
             self.delete(item)
         self._labels.clear()
 
-        # bed
+        # bed: a light aluminium plate, empty until a board is loaded
         x1 = x0 + tx * scale
         y1 = y0 - ty * scale
         self._bed_id = getattr(self, "_bed_id", None)
         if self._bed_id is None:
-            self._bed_id = self.create_rectangle(x0, y1, x1, y0, outline="#3c4f63", fill="#0d151e", width=2)
+            self._bed_id = self.create_rectangle(
+                x0, y1, x1, y0, outline=ALU_EDGE, fill=ALU_LIGHT, width=2
+            )
         else:
             self.coords(self._bed_id, x0, y1, x1, y0)
+            self.itemconfigure(self._bed_id, fill=ALU_LIGHT, outline=ALU_EDGE)
             self.tag_raise(self._bed_id)
+
+        # brushed aluminium: fine horizontal streaks
+        streak_colors = ("#dadde0", "#d2d7db", "#d8dcdf", "#cfd4d9", "#d5dade")
+        streak = 0
+        pixel_y = int(round(y1)) + 2
+        while pixel_y < y0 - 2:
+            self._labels.append(
+                self.create_line(
+                    x0 + 2,
+                    pixel_y,
+                    x1 - 2,
+                    pixel_y,
+                    fill=streak_colors[streak % len(streak_colors)],
+                    width=1,
+                )
+            )
+            pixel_y += 3
+            streak += 1
+
+        # T-slot grooves of the aluminium bed, running along X
+        for groove_y in (30.0, 90.0, 150.0):
+            if groove_y > ty:
+                continue
+            _, groove_top = self._to_screen(0.0, groove_y + 4.0)
+            _, groove_bottom = self._to_screen(0.0, groove_y - 4.0)
+            self._labels.append(
+                self.create_rectangle(
+                    x0 + 2, groove_top, x1 - 2, groove_bottom, fill="#b8bec5", outline=""
+                )
+            )
+            self._labels.append(
+                self.create_line(x0 + 2, groove_top, x1 - 2, groove_top, fill="#9aa2aa", width=1)
+            )
+            self._labels.append(
+                self.create_line(
+                    x0 + 2, groove_bottom, x1 - 2, groove_bottom, fill="#d9dde1", width=1
+                )
+            )
 
         # grid
         step = 20.0 if tx >= 120 else 10.0
@@ -223,14 +353,14 @@ class MachineView(tk.Canvas):
         while gx <= tx + 1e-6:
             sx, _ = self._to_screen(gx, 0)
             self._labels.append(
-                self.create_line(sx, y1, sx, y0, fill=GRID, width=1)
+                self.create_line(sx, y1, sx, y0, fill=ALU_LINE, width=1)
             )
             gx += step
         gy = 0.0
         while gy <= ty + 1e-6:
             _, sy = self._to_screen(0, gy)
             self._labels.append(
-                self.create_line(x0, sy, x1, sy, fill=GRID, width=1)
+                self.create_line(x0, sy, x1, sy, fill=ALU_LINE, width=1)
             )
             gy += step
 
@@ -240,62 +370,71 @@ class MachineView(tk.Canvas):
         while gx <= tx + 1e-6:
             sx, _ = self._to_screen(gx, 0)
             self._labels.append(
-                self.create_text(sx, y0 + 12, text=f"{gx:g}", fill="#5c6b7c", font=FONT_TINY)
+                self.create_text(sx, y0 + 12, text=f"{gx:g}", fill=ALU_MUTED, font=FONT_TINY)
             )
             gx += label_step
         gy = 0.0
         while gy <= ty + 1e-6:
             _, sy = self._to_screen(0, gy)
             self._labels.append(
-                self.create_text(x0 - 16, sy, text=f"{gy:g}", fill="#5c6b7c", font=FONT_TINY, anchor="e")
+                self.create_text(x0 - 16, sy, text=f"{gy:g}", fill=ALU_MUTED, font=FONT_TINY, anchor="e")
             )
             gy += label_step
 
         # axes at the machine zero corner
         self._labels.append(
-            self.create_line(x0, y0, x0 + 42, y0, fill="#e76f51", width=2, arrow="last")
+            self.create_line(x0, y0, x0 + 42, y0, fill="#c0392b", width=2, arrow="last")
         )
         self._labels.append(
-            self.create_line(x0, y0, x0, y0 - 42, fill=OK, width=2, arrow="last")
+            self.create_line(x0, y0, x0, y0 - 42, fill="#2e7d32", width=2, arrow="last")
         )
-        self._labels.append(self.create_text(x0 + 50, y0 + 2, text="X", fill="#e76f51", font=FONT_BOLD))
-        self._labels.append(self.create_text(x0 - 10, y0 - 50, text="Y", fill=OK, font=FONT_BOLD))
+        self._labels.append(self.create_text(x0 + 50, y0 + 2, text="X", fill="#c0392b", font=FONT_BOLD))
+        self._labels.append(self.create_text(x0 - 10, y0 - 50, text="Y", fill="#2e7d32", font=FONT_BOLD))
         self._labels.append(
             self.create_text(
                 (x0 + x1) / 2,
                 22,
                 text=f"CNC 3018 work table · {tx:g} × {ty:g} × {tz:g} mm",
-                fill=MUTED,
+                fill=ALU_TEXT,
                 font=FONT_SMALL,
             )
         )
+
+        # PCB (drawn above the table, below the tool and the Z gauge)
+        for item in self._board_items:
+            self.delete(item)
+        self._board_items.clear()
+        self._draw_board()
 
         # Z gauge
         gauge_x = width - 44
         z_top = y0 - tz * scale
         z_bottom = y0
         self._labels.append(
-            self.create_line(gauge_x, z_top, gauge_x, z_bottom, fill="#3c4f63", width=6)
+            self.create_line(gauge_x, z_top, gauge_x, z_bottom, fill=ALU_EDGE, width=6)
         )
         for fraction in (0.0, 0.25, 0.5, 0.75, 1.0):
             ty_px = z_bottom - (z_bottom - z_top) * fraction
             self._labels.append(
-                self.create_line(gauge_x - 8, ty_px, gauge_x + 8, ty_px, fill="#2f3d4d", width=1)
+                self.create_line(gauge_x - 8, ty_px, gauge_x + 8, ty_px, fill="#8f99a2", width=1)
             )
         self._labels.append(
-            self.create_text(gauge_x + 2, z_top - 14, text="Z", fill=MUTED, font=FONT_SMALL)
+            self.create_text(gauge_x + 2, z_top - 14, text="Z", fill=ALU_TEXT, font=FONT_SMALL)
         )
         self._z_top = z_top
         self._z_bottom = z_bottom
         self._z_gauge_x = gauge_x
         self._z_marker = getattr(self, "_z_marker", None)
         if self._z_marker is None:
-            self._z_marker = self.create_line(gauge_x - 11, z_bottom, gauge_x + 11, z_bottom, fill=ACCENT, width=3)
+            self._z_marker = self.create_line(gauge_x - 11, z_bottom, gauge_x + 11, z_bottom, fill="#0e7490", width=3)
         self._z_text = getattr(self, "_z_text", None)
         if self._z_text is None:
-            self._z_text = self.create_text(gauge_x, z_bottom + 18, text="Z 0.000", fill=ACCENT, font=FONT_TINY)
+            self._z_text = self.create_text(gauge_x, z_bottom + 18, text="Z 0.000", fill="#0e7490", font=FONT_TINY)
         self.coords(self._z_text, gauge_x, z_bottom + 18)
         self._update_trail()
+        self._raise_tool()
+
+    def _raise_tool(self) -> None:
         for item in (
             self._cross_arms[0],
             self._cross_arms[1],
@@ -308,6 +447,130 @@ class MachineView(tk.Canvas):
         ):
             self.tag_raise(item)
 
+    # ---------------------------------------------------------------- board
+    def set_board(self, board: Board | None) -> None:
+        """Show *board* on the table (``None`` clears the table)."""
+
+        self.board = board
+        self._board_offset = center_offset(board) if board is not None else (0.0, 0.0)
+        self._rebuild()
+
+    def clear_board(self) -> None:
+        self.set_board(None)
+
+    def _draw_board(self) -> None:
+        if self.board is None:
+            return
+        offset_x, offset_y = self._board_offset
+        loops = [
+            [self._to_screen(x + offset_x, y + offset_y) for x, y in loop]
+            for loop in self.board.loops
+        ]
+        loops = [loop for loop in loops if len(loop) >= 3]
+        if not loops:
+            return
+
+        fill_order = sorted(range(len(loops)), key=lambda i: -abs(_polygon_area(loops[i])))
+        outer: list[list[tuple[float, float]]] = []
+        cutouts: list[list[tuple[float, float]]] = []
+        for index in fill_order:
+            loop = loops[index]
+            if any(_point_in_polygon(loop[0][0], loop[0][1], other) for other in outer):
+                cutouts.append(loop)
+            else:
+                outer.append(loop)
+
+        # Soft shadow on the aluminium: light comes from the top-left.
+        for loop in outer:
+            for dx, dy, color in ((6.0, 7.0, "#b9c0c6"), (3.0, 4.0, "#a9b1b9")):
+                self._board_items.append(
+                    self.create_polygon(
+                        [
+                            coordinate
+                            for point in loop
+                            for coordinate in (point[0] + dx, point[1] + dy)
+                        ],
+                        fill=color,
+                        outline="",
+                        width=0,
+                    )
+                )
+
+        # Copper foil base and cut-outs.
+        for loop in outer:
+            self._board_items.append(
+                self.create_polygon(
+                    [coordinate for point in loop for coordinate in point],
+                    fill=BOARD_FILL,
+                    outline="",
+                    width=0,
+                )
+            )
+        for loop in cutouts:
+            self._board_items.append(
+                self.create_polygon(
+                    [coordinate for point in loop for coordinate in point],
+                    fill=ALU_PANEL,
+                    outline="",
+                    width=0,
+                )
+            )
+
+        # Brushed copper: a gentle sheen with fine horizontal grain.
+        top = min(point[1] for loop in loops for point in loop)
+        bottom = max(point[1] for loop in loops for point in loop)
+        height = max(bottom - top, 1.0)
+        for pixel_y in range(int(math.floor(top)), int(math.ceil(bottom)) + 1):
+            line_y = pixel_y + 0.5
+            factor = 1.10 - 0.20 * ((line_y - top) / height)
+            factor += 0.015 * math.sin(pixel_y * 1.7) + 0.008 * math.sin(pixel_y * 5.3)
+            for left, right in _span_intersections(loops, line_y):
+                span = right - left
+                if span <= 0.0:
+                    continue
+                for part in range(3):
+                    part_left = left + span * part / 3.0
+                    part_right = left + span * (part + 1) / 3.0
+                    part_factor = factor + (0.014 if part == 0 else -0.014 if part == 2 else 0.0)
+                    self._board_items.append(
+                        self.create_line(
+                            part_left,
+                            line_y,
+                            part_right,
+                            line_y,
+                            fill=_shade(BOARD_FILL, part_factor),
+                            width=1,
+                        )
+                    )
+
+        # Holes stay pure black, as requested.
+        for hole in self.board.holes:
+            center_x, center_y = self._to_screen(hole.x + offset_x, hole.y + offset_y)
+            radius = max(hole.diameter / 2.0 * self._geometry[2], 0.6)
+            self._board_items.append(
+                self.create_oval(
+                    center_x - radius,
+                    center_y - radius,
+                    center_x + radius,
+                    center_y + radius,
+                    fill=BOARD_HOLE,
+                    outline="",
+                )
+            )
+
+        # Milled edge of the board.
+        for loop in loops:
+            coordinates = [coordinate for point in loop for coordinate in point]
+            self._board_items.append(
+                self.create_line(
+                    *coordinates,
+                    coordinates[0],
+                    coordinates[1],
+                    fill=BOARD_EDGE,
+                    width=2,
+                )
+            )
+
     def _update_trail(self) -> None:
         if len(self.trail) < 2:
             self.itemconfigure(self._trail_id, state="hidden")
@@ -318,7 +581,8 @@ class MachineView(tk.Canvas):
             coords.extend((sx, sy))
         self.coords(self._trail_id, *coords)
         self.itemconfigure(self._trail_id, state="normal")
-        self.tag_raise(self._trail_id, self._bed_id)
+        self.tag_raise(self._trail_id)
+        self._raise_tool()
 
     def _update_cross(self) -> None:
         cx, cy = self._to_screen(self.mpos[0], self.mpos[1])
@@ -507,6 +771,7 @@ class App(tk.Tk):
         baudrate: int = 115200,
         eeprom_path: str | None = None,
         autoconnect: bool = False,
+        workfield_path: str | None = None,
     ) -> None:
         super().__init__()
         self.title("CNC 3018 — GRBL 1.1 emulator")
@@ -523,6 +788,16 @@ class App(tk.Tk):
         self._settings_dialog: SettingsDialog | None = None
         self._connected_at: float | None = None
         self._last_console_kind = ""
+
+        # PCB / work-field state
+        self._pcb_dir: Path | None = None
+        self._pcb_layers: dict[str, Path] = {}
+        self._pcb_holes: list[Hole] = []
+        self._pcb_board: Board | None = None
+        self._pcb_offset = (0.0, 0.0)
+        self._workfield_path = Path(workfield_path) if workfield_path else default_output_path()
+        self._workfield_token = 0
+        self._workfield_results: "queue.Queue[tuple[int, Path, Exception | None]]" = queue.Queue()
 
         self._configure_styles()
         self._build_ui(port, baudrate)
@@ -622,12 +897,13 @@ class App(tk.Tk):
 
         left = tk.Frame(self, bg=BG)
         left.grid(row=1, column=0, sticky="nsew", padx=(12, 6), pady=(4, 6))
-        left.grid_rowconfigure(0, weight=1)
+        left.grid_rowconfigure(1, weight=1)
         left.grid_columnconfigure(0, weight=1)
+        self._build_pcb_toolbar(left)
         self.machine_view = MachineView(left, width=820, height=560)
-        self.machine_view.grid(row=0, column=0, sticky="nsew")
+        self.machine_view.grid(row=1, column=0, sticky="nsew")
         footer = tk.Frame(left, bg=BG)
-        footer.grid(row=1, column=0, sticky="ew", pady=(4, 0))
+        footer.grid(row=2, column=0, sticky="ew", pady=(4, 0))
         tk.Label(
             footer,
             text="Крест вращается вместе со шпинделем: 10 000 об/мин → 60 об/мин. "
@@ -667,6 +943,140 @@ class App(tk.Tk):
 
     def _scroll_right(self, event) -> None:
         self.right_canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
+
+    # ------------------------------------------------------------------ PCB / work field
+    def _build_pcb_toolbar(self, parent: tk.Frame) -> None:
+        bar = tk.Frame(parent, bg=BG)
+        bar.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        ttk.Button(
+            bar,
+            text="Загрузить гербер + сверловка",
+            style="Accent.TButton",
+            command=self._choose_pcb_directory,
+        ).pack(side="left")
+        tk.Label(bar, text="Контур:", bg=BG, fg=MUTED, font=FONT_SMALL).pack(side="left", padx=(12, 4))
+        self.layer_var = tk.StringVar()
+        self.layer_combo = ttk.Combobox(
+            bar, textvariable=self.layer_var, state="disabled", width=34, values=[]
+        )
+        self.layer_combo.pack(side="left", ipady=2)
+        self.layer_combo.bind("<<ComboboxSelected>>", self._on_layer_selected)
+        self.pcb_status = tk.Label(bar, text="Стол пуст", bg=BG, fg=MUTED, font=FONT_SMALL)
+        self.pcb_status.pack(side="left", padx=(12, 0))
+
+    def _choose_pcb_directory(self) -> None:
+        initial = str(self._pcb_dir) if self._pcb_dir is not None else str(Path.cwd())
+        directory = filedialog.askdirectory(
+            parent=self,
+            title="Выберите папку с Gerber-файлами и сверловкой",
+            initialdir=initial,
+        )
+        if directory:
+            self.load_pcb_directory(directory)
+
+    def load_pcb_directory(self, directory: str | Path) -> None:
+        """Load all drill files and the Gerber layer list from *directory*."""
+
+        folder = Path(directory)
+        try:
+            drills, gerbers = discover_sources(folder)
+        except OSError as exc:
+            messagebox.showerror("Gerber", f"Не удалось прочитать папку:\n{exc}", parent=self)
+            return
+        if not gerbers:
+            messagebox.showwarning(
+                "Gerber",
+                "В папке нет Gerber-файлов (.gbr, .ger, .gtl, .gbl ...).",
+                parent=self,
+            )
+            return
+
+        holes: list[Hole] = []
+        for drill_path in drills:
+            try:
+                holes.extend(parse_excellon_file(drill_path))
+            except PcbError as exc:
+                self._log_system(f"Drill {drill_path.name}: {exc}")
+
+        self._pcb_dir = folder
+        self._pcb_layers = {path.name: path for path in gerbers}
+        self._pcb_holes = holes
+        names = list(self._pcb_layers)
+        self.layer_combo.configure(values=names, state="readonly")
+        preferred = guess_outline_layer(names, fallback=False)
+        if preferred is None:
+            self.layer_var.set("")
+            self.pcb_status.configure(text="Выберите слой контура")
+        else:
+            self.layer_var.set(preferred)
+        self._log_system(
+            f"PCB folder {folder}: {len(names)} Gerber layers, "
+            f"{len(drills)} drill files, {len(holes)} holes"
+        )
+        if preferred is not None:
+            self._apply_pcb_layer()
+
+    def _on_layer_selected(self, _event=None) -> None:
+        self._apply_pcb_layer()
+
+    def _apply_pcb_layer(self) -> None:
+        name = self.layer_var.get()
+        path = self._pcb_layers.get(name)
+        if path is None:
+            return
+        try:
+            loops = parse_gerber_contours(path)
+            board = Board(loops=loops, holes=list(self._pcb_holes), source=name)
+        except PcbError as exc:
+            messagebox.showerror("Gerber", f"{name}:\n{exc}", parent=self)
+            self.pcb_status.configure(text="Контур не загружен")
+            return
+
+        self._pcb_board = board
+        self._pcb_offset = center_offset(board)
+        self.machine_view.set_board(board)
+        info = (
+            f"{name} · {board.width:.2f} × {board.height:.2f} мм · "
+            f"{len(board.holes)} отв."
+        )
+        self.pcb_status.configure(text=info)
+        self._log_system(f"PCB loaded: {info}")
+        self._render_workfield_async(board)
+
+    def _render_workfield_async(self, board: Board) -> None:
+        """Draw the 20 px/mm camera image in a worker thread."""
+
+        self._workfield_token += 1
+        token = self._workfield_token
+        offset = self._pcb_offset
+        path = self._workfield_path
+
+        def worker() -> None:
+            error: Exception | None = None
+            try:
+                render_workfield(path, board, offset)
+            except Exception as exc:  # pragma: no cover - defensive
+                error = exc
+            self._workfield_results.put((token, path, error))
+
+        threading.Thread(target=worker, name="workfield-render", daemon=True).start()
+
+    def _drain_workfield_results(self) -> None:
+        while True:
+            try:
+                token, path, error = self._workfield_results.get_nowait()
+            except queue.Empty:
+                return
+            if token != self._workfield_token:
+                continue
+            if error is not None:
+                self._log_system(f"Work-field PNG failed: {error}")
+                continue
+            geometry = FieldGeometry()
+            self._log_system(
+                f"Work-field PNG: {path} "
+                f"({geometry.image_width}×{geometry.image_height} px, {PX_PER_MM:g} px/mm)"
+            )
 
     def _build_header(self, port: str, baudrate: int) -> None:
         header = tk.Frame(self, bg=PANEL, height=62)
@@ -1115,6 +1525,7 @@ class App(tk.Tk):
         if not self.host.connected:
             self.host.local_tick(dt)
         self._drain_log()
+        self._drain_workfield_results()
         snapshot = self.host.snapshot()
         self._apply_snapshot(snapshot, dt)
         self.after(28, self._tick)
@@ -1249,6 +1660,13 @@ def run(
     baudrate: int = 115200,
     eeprom_path: str | None = None,
     autoconnect: bool = False,
+    workfield_path: str | None = None,
 ) -> None:
-    app = App(port=port, baudrate=baudrate, eeprom_path=eeprom_path, autoconnect=autoconnect)
+    app = App(
+        port=port,
+        baudrate=baudrate,
+        eeprom_path=eeprom_path,
+        autoconnect=autoconnect,
+        workfield_path=workfield_path,
+    )
     app.mainloop()
