@@ -45,6 +45,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="GUI: open the port immediately at startup",
     )
     parser.add_argument(
+        "--workfield",
+        default=None,
+        metavar="PATH",
+        help=(
+            "PNG of the work field written when a board is loaded "
+            "(default: <project>/workfield/workfield.png)"
+        ),
+    )
+    parser.add_argument(
         "--version",
         action="version",
         version="CNC3018 GRBL emulator 1.0",
@@ -95,6 +104,7 @@ def main(argv: list[str] | None = None) -> int:
         baudrate=args.baud,
         eeprom_path=eeprom,
         autoconnect=args.autoconnect,
+        workfield_path=args.workfield,
     )
     return 0
 
